@@ -1,12 +1,84 @@
+import argparse
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
-import talib
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator, ADXIndicator
 import psutil
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from tqdm.contrib.concurrent import process_map
+
+
+print(vbt.__version__)
+
+DEFAULT_DATA_ROOT = Path("data/monthly/BTC-USD")
+OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+
+
+def timeframe_to_freq(timeframe: str) -> str:
+    timeframe = timeframe.lower().strip()
+    units = {"m": "min", "h": "h", "d": "d"}
+
+    if len(timeframe) < 2 or timeframe[-1] not in units:
+        raise ValueError(
+            "Timeframe must use a supported suffix, such as 1m, 15m, 1h, or 1d."
+        )
+
+    value = timeframe[:-1]
+    if not value.isdigit() or int(value) <= 0:
+        raise ValueError("Timeframe must start with a positive integer.")
+
+    return f"{int(value)}{units[timeframe[-1]]}"
+
+
+def normalize_freq(freq: str) -> str:
+    try:
+        return timeframe_to_freq(freq)
+    except ValueError:
+        return freq
+
+
+def load_timeframe_data(timeframe: str, data_root: Path = DEFAULT_DATA_ROOT) -> pd.DataFrame:
+    timeframe = timeframe.lower().strip()
+    data_dir = data_root / timeframe
+
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Could not find data directory: {data_dir}")
+
+    csv_paths = sorted(data_dir.glob("*.csv"))
+    if not csv_paths:
+        raise FileNotFoundError(f"No CSV files found in data directory: {data_dir}")
+
+    dataframes = []
+    for csv_path in csv_paths:
+        df = pd.read_csv(csv_path)
+        df.columns = [column.strip().lower() for column in df.columns]
+
+        if "timestamp" not in df.columns:
+            df = df.rename(columns={df.columns[0]: "timestamp"})
+
+        missing_columns = {"timestamp", *OHLCV_COLUMNS} - set(df.columns)
+        if missing_columns:
+            missing = ", ".join(sorted(missing_columns))
+            raise ValueError(f"{csv_path} is missing required columns: {missing}")
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        for column in OHLCV_COLUMNS:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+        dataframes.append(df[["timestamp", *OHLCV_COLUMNS]])
+
+    dataframe = pd.concat(dataframes, ignore_index=True)
+    dataframe = dataframe.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    dataframe = dataframe.sort_values("timestamp")
+    dataframe = dataframe.drop_duplicates(subset="timestamp", keep="last")
+    dataframe = dataframe.set_index("timestamp")
+
+    return dataframe
 
 
 def fit_model_backtest(kv_pairs: dict) -> tuple[int, dict[str, object]]:
@@ -19,10 +91,11 @@ def fit_model_backtest(kv_pairs: dict) -> tuple[int, dict[str, object]]:
     # creating a copy of the dataframe which will have the indicators applied to it
     df = dataframe[["open", "high", "low", "close"]].copy(deep=True)
 
-    # since I am using 1 minute data, this is not necessary, it's used for resampling OHLC data for higher time intervals
-    if resample != "1T":
+    # Resampling is optional because the input CSVs can already use the target timeframe.
+    if resample:
         ohlc_dict = {"open": "first", "high": "max", "low": "min", "close": "last"}
         df = df.resample(resample).apply(ohlc_dict)
+        df = df.dropna(subset=["open", "high", "low", "close"])
 
     # indicators applied to the data, a standard 14 period is used for all the indicators, keeping the strategy simple
     # I have used the Random forest algorithm which is basically a collection of decision trees, hence it doesn't require
@@ -32,9 +105,9 @@ def fit_model_backtest(kv_pairs: dict) -> tuple[int, dict[str, object]]:
 
     df["pct_change"] = df["close"].pct_change()
     df["pct_change_15"] = df["close"].pct_change(15)
-    df["rsi"] = talib.RSI(df["close"], timeperiod=timeperiod)
-    df["adx"] = talib.ADX(df["high"], df["low"], df["close"], timeperiod=timeperiod)
-    df["sma"] = talib.SMA(df["close"], timeperiod=timeperiod)
+    df["rsi"] = RSIIndicator(df["close"], window=timeperiod).rsi()
+    df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], window=timeperiod).adx()
+    df["sma"] = SMAIndicator(df["close"], window=timeperiod).sma_indicator()
     df["sma/close"] = df["sma"] / df["close"]
     df["corr"] = df["close"].rolling(timeperiod).corr(df["sma"])
     df["volatility"] = df["pct_change"].rolling(timeperiod).std() * 100
@@ -74,7 +147,8 @@ def fit_model_backtest(kv_pairs: dict) -> tuple[int, dict[str, object]]:
     train_data["forecast"] = model.predict(train_data[inputs])
     test_data["forecast"] = model.predict(test_data[inputs])
 
-    # signal is used to buy or sell, essentially the forecast shifted by one to account for the delay in placing the trades
+    # signal is used to buy or sell, essentially the forecast shifted by one to account for the delay in placing the
+    # trades
     train_data["signal"] = train_data["forecast"].shift(1)
     test_data["signal"] = test_data["forecast"].shift(1)
 
@@ -116,9 +190,49 @@ def fit_model_backtest(kv_pairs: dict) -> tuple[int, dict[str, object]]:
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the BTC-USD random forest backtest.")
+    parser.add_argument(
+        "--timeframe",
+        default="1d",
+        help="Timeframe folder to load under the data root, such as 1m, 15m, 1h, or 1d.",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="Root directory that contains timeframe folders.",
+    )
+    parser.add_argument(
+        "--resample",
+        default=None,
+        help="Optional frequency to resample input data before backtesting, such as 15m, 15min, or 1h.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output CSV path for KPI results. Defaults to KPI_<timeframe>.csv.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=psutil.cpu_count(logical=True),
+        help="Maximum number of worker processes to use for backtests.",
+    )
+
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    timeframe = args.timeframe.lower().strip()
+    resample = normalize_freq(args.resample) if args.resample else None
+    freq = resample or timeframe_to_freq(timeframe)
+
     # loading the raw data
-    dataframe = pd.read_csv("BTCUSD_M1.csv", index_col=0, parse_dates=True)
+    dataframe = load_timeframe_data(timeframe, args.data_root)
+    output_path = args.output or Path(f"KPI_{timeframe}.csv")
 
     # creating the various key value pairs that will be passed for backtesting
     # the hyperparameter being optimized for is the number of esitmators, i.e the number of decision trees in the model
@@ -126,8 +240,8 @@ def main():
         {
             "dataframe": dataframe,
             "num_estimators": num_estimators,
-            "freq": "1min",
-            "resample": "1T",
+            "freq": freq,
+            "resample": resample,
         }
         for num_estimators in range(5, 26, 1)
     ]
@@ -141,14 +255,15 @@ def main():
         process_map(
             fit_model_backtest,
             kv_pairs_list,
-            max_workers=psutil.cpu_count(logical=True),
+            max_workers=args.max_workers,
             desc="Backtests",
         )
     )
 
     # saving the backtest results
     kpis_df = pd.DataFrame(backtest_results)
-    kpis_df.to_csv("KPI_M1.csv")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    kpis_df.to_csv(output_path)
 
 
 if __name__ == "__main__":
