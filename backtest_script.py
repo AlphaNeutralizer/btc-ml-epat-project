@@ -82,6 +82,61 @@ def load_timeframe_data(timeframe: str, data_root: Path = DEFAULT_DATA_ROOT) -> 
     return dataframe
 
 
+def validate_non_overlapping_signals(signals: dict[str, pd.Series]) -> None:
+    signal_items = [
+        (name, series.fillna(False).astype(bool)) for name, series in signals.items()
+    ]
+
+    for left_index, (left_name, left_series) in enumerate(signal_items):
+        for right_name, right_series in signal_items[left_index + 1 :]:
+            overlap = left_series & right_series
+            if not overlap.any():
+                continue
+
+            overlap_index = overlap[overlap].index
+            examples = ", ".join(str(index_value) for index_value in overlap_index[:5])
+            if len(overlap_index) > 5:
+                examples = f"{examples}, ..."
+            raise ValueError(
+                f"Signal overlap detected between '{left_name}' and '{right_name}' "
+                f"at: {examples}"
+            )
+
+
+def build_trade_events(signal: pd.Series, allow_short: bool) -> dict[str, pd.Series]:
+    events = {
+        "long_entries": pd.Series(False, index=signal.index),
+        "long_exits": pd.Series(False, index=signal.index),
+        "short_entries": pd.Series(False, index=signal.index),
+        "short_exits": pd.Series(False, index=signal.index),
+    }
+    position = 0
+
+    for timestamp, signal_value in signal.items():
+        target = 0
+        if signal_value == 1:
+            target = 1
+        elif allow_short and signal_value == -1:
+            target = -1
+
+        if position == 0:
+            if target == 1:
+                events["long_entries"].loc[timestamp] = True
+                position = 1
+            elif target == -1:
+                events["short_entries"].loc[timestamp] = True
+                position = -1
+        elif position == 1 and target != 1:
+            events["long_exits"].loc[timestamp] = True
+            position = 0
+        elif position == -1 and target != -1:
+            events["short_exits"].loc[timestamp] = True
+            position = 0
+
+    validate_non_overlapping_signals(events)
+    return events
+
+
 def run_model_backtest(
     dataframe: pd.DataFrame,
     num_estimators: int,
@@ -154,21 +209,20 @@ def run_model_backtest(
     test_data["signal"] = test_data["forecast"].shift(1)
 
     # creating entry/exit events from signal state transitions.
-    test_long_signal = test_data["signal"] == 1
-    previous_long_signal = test_long_signal.shift(1, fill_value=False)
-    test_long_entries = test_long_signal & ~previous_long_signal
-    test_long_exits = ~test_long_signal & previous_long_signal
+    trade_events = build_trade_events(test_data["signal"], allow_short)
+    test_long_entries = trade_events["long_entries"]
+    test_long_exits = trade_events["long_exits"]
+    test_short_entries = trade_events["short_entries"]
+    test_short_exits = trade_events["short_exits"]
     test_buy_signals = test_long_entries
     test_sell_signals = test_long_exits
 
-    if allow_short:
-        test_short_signal = test_data["signal"] == -1
-        previous_short_signal = test_short_signal.shift(1, fill_value=False)
-        test_short_entries = test_short_signal & ~previous_short_signal
-        test_short_exits = ~test_short_signal & previous_short_signal
-    else:
-        test_short_entries = pd.Series(False, index=test_data.index)
-        test_short_exits = pd.Series(False, index=test_data.index)
+    validate_non_overlapping_signals(
+        {
+            "buy_signals": test_buy_signals,
+            "sell_signals": test_sell_signals,
+        }
+    )
 
     # using Vectorbt to run a vectorized backtest on the training data
     test_pf = vbt.Portfolio.from_signals(
@@ -562,6 +616,10 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+
+    for name, value in vars(args).items():
+        print(f"{name}: {value}")
+
     timeframe = args.timeframe.lower().strip()
     resample = normalize_freq(args.resample) if args.resample else None
     freq = resample or timeframe_to_freq(timeframe)
