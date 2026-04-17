@@ -16,8 +16,6 @@ from sklearn.metrics import accuracy_score
 from tqdm.contrib.concurrent import process_map
 
 
-print(vbt.__version__)
-
 DEFAULT_DATA_ROOT = Path("data/monthly/BTC-USD")
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 DEFAULT_BEST_METRIC = "Sharpe Ratio"
