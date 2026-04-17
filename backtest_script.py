@@ -359,7 +359,6 @@ def write_plotly_report(
     if isinstance(equity, pd.DataFrame):
         equity = equity.iloc[:, 0]
 
-    btc_price = test_data["close"]
     benchmark = test_data["close"] / test_data["close"].iloc[0] * equity.iloc[0]
     cumulative_return = (equity / equity.iloc[0] - 1) * 100
     positive_return = cumulative_return.where(cumulative_return >= 0)
@@ -379,20 +378,18 @@ def write_plotly_report(
     max_drawdown = format_plotly_metric(stats.get("Max Drawdown [%]"))
 
     fig = make_subplots(
-        rows=4,
+        rows=3,
         cols=1,
         shared_xaxes=True,
         specs=[
             [{"type": "xy"}],
             [{"type": "xy"}],
-            [{"type": "xy"}],
             [{"type": "table"}],
         ],
-        row_heights=[0.29, 0.22, 0.2, 0.29],
+        row_heights=[0.38, 0.27, 0.35],
         vertical_spacing=0.06,
         subplot_titles=(
             "Equity Curve",
-            "BTC Price",
             "Return / Drawdown [%]",
             "Vectorbt Stats",
         ),
@@ -456,17 +453,6 @@ def write_plotly_report(
     )
     fig.add_trace(
         go.Scatter(
-            x=btc_price.index,
-            y=btc_price.values,
-            mode="lines",
-            name="BTC Close",
-            line={"color": "#0f766e", "width": 1.6},
-        ),
-        row=2,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
             x=positive_return.index,
             y=positive_return.values,
             mode="lines",
@@ -476,7 +462,7 @@ def write_plotly_report(
             line={"color": "#16a34a", "width": 1.5},
             fillcolor="rgba(22, 163, 74, 0.25)",
         ),
-        row=3,
+        row=2,
         col=1,
     )
     fig.add_trace(
@@ -490,7 +476,7 @@ def write_plotly_report(
             line={"color": "#dc2626", "width": 1.5},
             fillcolor="rgba(220, 38, 38, 0.25)",
         ),
-        row=3,
+        row=2,
         col=1,
     )
     fig.add_trace(
@@ -501,7 +487,7 @@ def write_plotly_report(
             name="Drawdown [%]",
             line={"color": "#991b1b", "width": 1.4, "dash": "dot"},
         ),
-        row=3,
+        row=2,
         col=1,
     )
     fig.add_trace(
@@ -520,7 +506,7 @@ def write_plotly_report(
                 "height": 24,
             },
         ),
-        row=4,
+        row=3,
         col=1,
     )
 
@@ -538,9 +524,8 @@ def write_plotly_report(
         margin={"l": 70, "r": 40, "t": 110, "b": 50},
     )
     fig.update_yaxes(title_text="Portfolio Value", row=1, col=1)
-    fig.update_yaxes(title_text="BTC Close", row=2, col=1)
-    fig.update_yaxes(title_text="Percent", row=3, col=1)
-    fig.update_xaxes(title_text="Date", row=3, col=1)
+    fig.update_yaxes(title_text="Percent", row=2, col=1)
+    fig.update_xaxes(title_text="Date", row=2, col=1)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(output_path, include_plotlyjs=True)
