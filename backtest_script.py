@@ -154,10 +154,11 @@ def run_model_backtest(
         df = df.resample(resample).apply(ohlc_dict)
         df = df.dropna(subset=["open", "high", "low", "close"])
 
-    # indicators applied to the data, a standard 14 period is used for all the indicators, keeping the strategy simple
-    # I have used the Random forest algorithm which is basically a collection of decision trees, hence it doesn't require
-    # scaling of data. Additionally all the indicators I have used range from 0-100 or -1 to 1 as I take ratios for those that
-    # don't have upper and lower bounds, hence the rules to tend to persist for longer periods.
+    # indicators applied to the data, a standard 14 period is used for all the indicators, keeping the strategy
+    # simple I have used the Random forest algorithm which is basically a collection of decision trees,
+    # hence it doesn't require scaling of data. Additionally, all the indicators I have used range from 0-100 or -1 to
+    # 1 as I take ratios for those that don't have upper and lower bounds, hence the rules to tend to persist for
+    # longer periods.
     timeperiod = 14
 
     df["pct_change"] = df["close"].pct_change()
