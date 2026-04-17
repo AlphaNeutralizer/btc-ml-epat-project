@@ -19,6 +19,7 @@ from tqdm.contrib.concurrent import process_map
 DEFAULT_DATA_ROOT = Path("data/monthly/BTC-USD")
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 DEFAULT_BEST_METRIC = "Sharpe Ratio"
+DEFAULT_SIGNAL_MODE = "events"
 
 
 def timeframe_to_freq(timeframe: str) -> str:
@@ -138,12 +139,44 @@ def build_trade_events(signal: pd.Series, allow_short: bool) -> dict[str, pd.Ser
     return events
 
 
+def build_raw_signals(signal: pd.Series, allow_short: bool) -> dict[str, pd.Series]:
+    raw_signals = {
+        "long_entries": signal == 1,
+        "long_exits": signal.shift(-1) != 1,
+        "short_entries": pd.Series(False, index=signal.index),
+        "short_exits": pd.Series(False, index=signal.index),
+    }
+
+    if allow_short:
+        raw_signals["short_entries"] = signal == -1
+        raw_signals["short_exits"] = signal.shift(-1) != -1
+
+    return raw_signals
+
+
+def build_vectorbt_signals(
+    signal: pd.Series,
+    allow_short: bool,
+    signal_mode: str,
+) -> tuple[dict[str, pd.Series], dict[str, pd.Series]]:
+    plot_events = build_trade_events(signal, allow_short)
+
+    if signal_mode == "events":
+        return plot_events, plot_events
+
+    if signal_mode == "raw":
+        return build_raw_signals(signal, allow_short), plot_events
+
+    raise ValueError(f"Unsupported signal mode: {signal_mode}")
+
+
 def run_model_backtest(
     dataframe: pd.DataFrame,
     num_estimators: int,
     freq: str,
     resample: str | None,
     allow_short: bool,
+    signal_mode: str,
 ) -> dict[str, object]:
     # creating a copy of the dataframe which will have the indicators applied to it
     df = dataframe[["open", "high", "low", "close"]].copy(deep=True)
@@ -210,21 +243,18 @@ def run_model_backtest(
     train_data["signal"] = train_data["forecast"].shift(1)
     test_data["signal"] = test_data["forecast"].shift(1)
 
-    # creating entry/exit events from signal state transitions.
-    trade_events = build_trade_events(test_data["signal"], allow_short)
-    test_long_entries = trade_events["long_entries"]
-    test_long_exits = trade_events["long_exits"]
-    test_short_entries = trade_events["short_entries"]
-    test_short_exits = trade_events["short_exits"]
-    test_buy_signals = test_long_entries
-    test_sell_signals = test_long_exits
-
-    validate_non_overlapping_signals(
-        {
-            "buy_signals": test_buy_signals,
-            "sell_signals": test_sell_signals,
-        }
+    # Create the signals used by vectorbt, plus clean transition events for plotting markers.
+    vectorbt_signals, plot_events = build_vectorbt_signals(
+        test_data["signal"],
+        allow_short,
+        signal_mode,
     )
+    test_long_entries = vectorbt_signals["long_entries"]
+    test_long_exits = vectorbt_signals["long_exits"]
+    test_short_entries = vectorbt_signals["short_entries"]
+    test_short_exits = vectorbt_signals["short_exits"]
+    test_buy_signals = plot_events["long_entries"]
+    test_sell_signals = plot_events["long_exits"]
 
     # using Vectorbt to run a vectorized backtest on the training data
     test_pf = vbt.Portfolio.from_signals(
@@ -267,6 +297,7 @@ def run_model_backtest(
         "buy_signals": test_buy_signals,
         "sell_signals": test_sell_signals,
         "allow_short": allow_short,
+        "signal_mode": signal_mode,
     }
 
 
@@ -277,8 +308,16 @@ def fit_model_backtest(kv_pairs: dict) -> tuple[int, dict[str, object]]:
     freq = kv_pairs["freq"]
     resample = kv_pairs["resample"]
     allow_short = kv_pairs["allow_short"]
+    signal_mode = kv_pairs["signal_mode"]
 
-    result = run_model_backtest(dataframe, num_estimators, freq, resample, allow_short)
+    result = run_model_backtest(
+        dataframe,
+        num_estimators,
+        freq,
+        resample,
+        allow_short,
+        signal_mode,
+    )
 
     return (
         num_estimators,
@@ -335,12 +374,26 @@ def format_plotly_metric(value: object) -> str:
     return str(value)
 
 
-def default_plot_output_path(timeframe: str, resample: str | None) -> Path:
+def signal_mode_suffix(signal_mode: str) -> str:
+    return "" if signal_mode == DEFAULT_SIGNAL_MODE else f"_{signal_mode}"
+
+
+def default_kpi_output_path(timeframe: str, signal_mode: str) -> Path:
+    return Path(f"KPI_{timeframe}{signal_mode_suffix(signal_mode)}.csv")
+
+
+def default_plot_output_path(
+    timeframe: str,
+    resample: str | None,
+    signal_mode: str,
+) -> Path:
     if not resample:
-        return Path(f"backtest_report_{timeframe}.html")
+        return Path(f"backtest_report_{timeframe}{signal_mode_suffix(signal_mode)}.html")
 
     safe_resample = resample.replace("/", "-").replace("\\", "-")
-    return Path(f"backtest_report_{timeframe}_resampled_{safe_resample}.html")
+    return Path(
+        f"backtest_report_{timeframe}_resampled_{safe_resample}{signal_mode_suffix(signal_mode)}.html"
+    )
 
 
 def write_plotly_report(
@@ -589,6 +642,15 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Allow the strategy to open short positions when the model predicts -1.",
     )
+    parser.add_argument(
+        "--signal-mode",
+        choices=["events", "raw"],
+        default=DEFAULT_SIGNAL_MODE,
+        help=(
+            "Use cleaned transition events or the raw vectorbt-style signal booleans "
+            "for portfolio simulation."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -605,7 +667,7 @@ def main():
 
     # loading the raw data
     dataframe = load_timeframe_data(timeframe, args.data_root)
-    output_path = args.output or Path(f"KPI_{timeframe}.csv")
+    output_path = args.output or default_kpi_output_path(timeframe, args.signal_mode)
 
     # creating the various key value pairs that will be passed for backtesting
     # the hyperparameter being optimized for is the number of estimators, i.e the number of decision trees in the model
@@ -616,6 +678,7 @@ def main():
             "freq": freq,
             "resample": resample,
             "allow_short": args.allow_short,
+            "signal_mode": args.signal_mode,
         }
         for num_estimators in range(5, 26, 1)
     ]
@@ -652,13 +715,19 @@ def main():
             freq,
             resample,
             args.allow_short,
+            args.signal_mode,
         )
-        plot_output_path = args.plot_output or default_plot_output_path(timeframe, resample)
+        plot_output_path = args.plot_output or default_plot_output_path(
+            timeframe,
+            resample,
+            args.signal_mode,
+        )
         report_title = f"BTC-USD {timeframe} Backtest"
         if resample:
             report_title = f"{report_title} Resampled to {resample}"
         if not args.allow_short:
             report_title = f"{report_title} Long Only"
+        report_title = f"{report_title} {args.signal_mode.title()} Signals"
         write_plotly_report(plot_result, plot_output_path, report_title, plot_estimator)
 
         print(f"Saved Plotly report to {plot_output_path}")
