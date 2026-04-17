@@ -8,6 +8,9 @@ from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator, ADXIndicator
 import psutil
 
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from tqdm.contrib.concurrent import process_map
@@ -347,14 +350,6 @@ def write_plotly_report(
     title: str,
     num_estimators: int,
 ) -> None:
-    try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-    except ImportError as error:
-        raise ImportError(
-            "Plotly is required to create the backtest report. Install it with: pip install plotly"
-        ) from error
-
     portfolio = result["portfolio"]
     stats = result["stats"]
     test_data = result["test_data"]
